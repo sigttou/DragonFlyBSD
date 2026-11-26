@@ -417,6 +417,11 @@ obj_free(Obj_Entry *obj)
 	STAILQ_REMOVE_HEAD(&obj->dagmembers, link);
 	free(elm);
     }
+    while (!STAILQ_EMPTY(&obj->relocdeps)) {
+	elm = STAILQ_FIRST(&obj->relocdeps);
+	STAILQ_REMOVE_HEAD(&obj->relocdeps, link);
+	free(elm);
+    }
     if (obj->vertab)
 	free(obj->vertab);
     if (obj->origin_path)
@@ -441,6 +446,7 @@ obj_new(void)
     STAILQ_INIT(&obj->dldags);
     STAILQ_INIT(&obj->dagmembers);
     STAILQ_INIT(&obj->names);
+    STAILQ_INIT(&obj->relocdeps);
     return obj;
 }
 

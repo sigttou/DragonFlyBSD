@@ -112,7 +112,7 @@ static int load_preload_objects(void);
 static Obj_Entry *load_object(const char *, int fd, const Obj_Entry *, int);
 static void map_stacks_exec(RtldLockState *);
 static Obj_Entry *obj_from_addr(const void *);
-static void objlist_call_fini(Objlist *, Obj_Entry *, RtldLockState *);
+static void objlist_call_fini(Objlist *, bool, RtldLockState *);
 static void objlist_call_init(Objlist *, RtldLockState *);
 static void objlist_clear(Objlist *);
 static Objlist_Entry *objlist_find(Objlist *, const Obj_Entry *);
@@ -147,8 +147,12 @@ static int symlook_needed(SymLook *, const Needed_Entry *, DoneList *);
 static int symlook_obj1_sysv(SymLook *, const Obj_Entry *);
 static int symlook_obj1_gnu(SymLook *, const Obj_Entry *);
 static void trace_loaded_objects(Obj_Entry *);
-static void unlink_object(Obj_Entry *);
-static void unload_object(Obj_Entry *);
+static void unload_objects(RtldLockState *);
+static void mark_live_objects(void);
+static void fini_order_reset(void);
+static void fini_order_build(Objlist *, bool);
+static Objlist_Entry *next_fini(Objlist *, bool);
+static void add_relocdep(const Obj_Entry *, const Obj_Entry *, RtldLockState *);
 static void unref_dag(Obj_Entry *);
 static void ref_dag(Obj_Entry *);
 static char *origin_subst_one(char *, const char *, const char *, bool);
@@ -197,6 +201,35 @@ static const Obj_Entry *rtld_functrace_obj;	/* Object thereof */
 static Obj_Entry *obj_list;	/* Head of linked list of shared objects */
 static Obj_Entry **obj_tail;	/* Link field of last object in list */
 static Obj_Entry **preload_tail;
+static bool collecting;		/* Nested unloads are deferred. */
+static unsigned int graph_gen = 1;	/* Bumped when edges change. */
+static unsigned int ref_gen = 1;	/* Bumped on a refcount change. */
+static unsigned int mark_serial;	/* Only increases; see build. */
+
+/*
+ * Finalization order state for one objlist_call_fini() pass.  The list's own
+ * (reverse init) order is the base order; a dependency only moves a consumer
+ * ahead of a provider it reaches.  A moved consumer delays its providers
+ * behind unrelated objects, which keep their relative order but not their
+ * position.  "reach" holds one bitset per candidate it reaches, "rreach"
+ * the reverse, and "blocked" counts the candidates still to finalize first.
+ */
+static struct {
+    Objlist *list;
+    unsigned int n;
+    unsigned int words;
+    Obj_Entry **cand;
+    unsigned long *reach;
+    unsigned long *rreach;
+    unsigned int *blocked;
+    unsigned int cap;		/* Allocated candidates/blocked */
+    unsigned int bits_cap;	/* Allocated words per bitset */
+    unsigned int graph_gen;
+    unsigned int ref_gen;
+    bool exiting;		/* The cache belongs to an exit pass */
+    bool built;
+    bool degraded;		/* No memory for the bitsets: legacy order */
+} fini_order;
 static Obj_Entry *obj_main;	/* The main program shared object */
 static Obj_Entry obj_rtld;	/* The dynamic linker shared object */
 static unsigned int obj_count;	/* Number of objects in obj_list */
@@ -1668,6 +1701,7 @@ find_symdef(unsigned long symnum, const Obj_Entry *refobj,
     }
 
     if (def != NULL) {
+	add_relocdep(refobj, defobj, lockstate);
 	*defobj_out = defobj;
 	/* Record the information in the cache to avoid subsequent lookups. */
 	if (cache != NULL) {
@@ -1830,6 +1864,7 @@ init_dag(Obj_Entry *root)
 
     if (root->dag_inited)
 	return;
+    graph_gen++;
     donelist_init(&donelist);
 
     /* Root object belongs to own DAG. */
@@ -2152,7 +2187,7 @@ load_object(const char *name, int fd_u, const Obj_Entry *refobj, int flags)
     fd = -1;
     if (name != NULL) {
 	for (obj = obj_list->next;  obj != NULL;  obj = obj->next) {
-	    if (object_match_name(obj, name))
+	    if (!obj->load_failed && object_match_name(obj, name))
 		return (obj);
 	}
 
@@ -2197,7 +2232,7 @@ load_object(const char *name, int fd_u, const Obj_Entry *refobj, int flags)
 	return NULL;
     }
     for (obj = obj_list->next;  obj != NULL;  obj = obj->next)
-	if (obj->ino == sb.st_ino && obj->dev == sb.st_dev)
+	if (!obj->load_failed && obj->ino == sb.st_ino && obj->dev == sb.st_dev)
 	    break;
     if (obj != NULL && name != NULL) {
 	object_add_name(obj, name);
@@ -2326,20 +2361,18 @@ preinit_main(void)
 
 /*
  * Call the finalization functions for each of the objects in "list"
- * belonging to the DAG of "root" and referenced once. If NULL "root"
- * is specified, every finalization function will be called regardless
- * of the reference count and the list elements won't be freed. All of
+ * which are unreachable, or all objects when exiting. Dependencies are
+ * finalized after their consumers where the dependency graph is acyclic.
+ * Keep every object mapped until this pass completes. All of
  * the objects are expected to have non-NULL fini functions.
  */
 static void
-objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
+objlist_call_fini(Objlist *list, bool exiting, RtldLockState *lockstate)
 {
     Objlist_Entry *elm;
     char *saved_msg;
     Elf_Addr *fini_addr;
     int index;
-
-    assert(root == NULL || root->refcount == 1);
 
     /*
      * Preserve the current error message since a fini function might
@@ -2347,10 +2380,8 @@ objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
      */
     saved_msg = errmsg_save();
     do {
-	STAILQ_FOREACH(elm, list, link) {
-	    if (root != NULL && (elm->obj->refcount != 1 ||
-	      objlist_find(&root->dagmembers, elm->obj) == NULL))
-		continue;
+	elm = next_fini(list, exiting);
+	if (elm != NULL) {
 
 	    /* Remove object from fini list to prevent recursive invocation. */
 	    STAILQ_REMOVE(list, elm, Struct_Objlist_Entry, link);
@@ -2361,6 +2392,8 @@ objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
 	     * won't be unloaded although its fini function has been
 	     * called.
 	     */
+	    /* Nested dlclose defers collection until we regain the lock. */
+	    elm->obj->fini_running = true;
 	    lock_release(rtld_bind_lock, lockstate);
 
 	    /*
@@ -2390,17 +2423,17 @@ objlist_call_fini(Objlist *list, Obj_Entry *root, RtldLockState *lockstate)
 		call_initfini_pointer(elm->obj, elm->obj->fini);
 	    }
 	    wlock_acquire(rtld_bind_lock, lockstate);
-	    /* No need to free anything if process is going down. */
-	    if (root != NULL)
-		free(elm);
+	    elm->obj->fini_running = false;
+	    free(elm);
 	    /*
-	     * We must restart the list traversal after every fini call
-	     * because a dlclose() call from the fini function or from
-	     * another thread might have modified the reference counts.
+	     * The order is recomputed after every fini call: a dlclose()
+	     * from the fini function, a dlopen() that revives an object, or
+	     * another thread can have changed the reference counts or the
+	     * graph.
 	     */
-	    break;
 	}
     } while (elm != NULL);
+    fini_order_reset();
     errmsg_restore(saved_msg);
 }
 
@@ -2785,8 +2818,8 @@ rtld_exit(void)
 
     wlock_acquire(rtld_bind_lock, &lockstate);
     dbg("rtld_exit()");
-    objlist_call_fini(&list_fini, NULL, &lockstate);
-    /* No need to remove the items from the list, since we are exiting. */
+    collecting = true;
+    objlist_call_fini(&list_fini, true, &lockstate);
     if (!libmap_disable)
         lm_fini();
     lock_release(rtld_bind_lock, &lockstate);
@@ -2963,21 +2996,8 @@ dlclose(void *handle)
     /* Unreference the object and its dependencies. */
     root->dl_refcount--;
 
-    if (root->refcount == 1) {
-	/*
-	 * The object will be no longer referenced, so we must unload it.
-	 * First, call the fini functions.
-	 */
-	objlist_call_fini(&list_fini, root, &lockstate);
-
-	unref_dag(root);
-
-	/* Finish cleaning up the newly-unreferenced objects. */
-	GDB_STATE(RT_DELETE,&root->linkmap);
-	unload_object(root);
-	GDB_STATE(RT_CONSISTENT,NULL);
-    } else
-	unref_dag(root);
+    unref_dag(root);
+    unload_objects(&lockstate);
 
     LD_UTRACE(UTRACE_DLCLOSE_STOP, handle, NULL, 0, 0, NULL);
     lock_release(rtld_bind_lock, &lockstate);
@@ -3034,13 +3054,36 @@ rtld_dlopen(const char *name, int fd, int mode)
 }
 
 static void
-dlopen_cleanup(Obj_Entry *obj)
+dlopen_cleanup(Obj_Entry *obj, RtldLockState *lockstate)
 {
+    Objlist_Entry *elm;
 
-	obj->dl_refcount--;
-	unref_dag(obj);
-	if (obj->refcount == 0)
-		unload_object(obj);
+    obj->dl_refcount--;
+    unref_dag(obj);
+    /*
+     * A retained object (RTLD_NODELETE) keeps a reference after this call, so
+     * it must stay usable: hiding it from lookup would make a later dlopen()
+     * map a second copy of a file that is still mapped.  Such an object also
+     * stays on list_fini without ever having been initialized, so its
+     * finalizer still runs at exit, as before this change.
+     */
+    if (obj->refcount == 0) {
+	obj->load_failed = true;
+	objlist_remove(&list_global, obj);
+	if (!obj->init_done)
+	    objlist_remove(&list_fini, obj);
+    }
+    mark_live_objects();
+    /* A finalizer may retry a dependency before deferred unmapping. */
+    STAILQ_FOREACH(elm, &obj->dagmembers, link) {
+	objlist_remove(&elm->obj->dldags, obj);
+	if (!elm->obj->live && !elm->obj->init_done) {
+	    elm->obj->load_failed = true;
+	    objlist_remove(&list_global, elm->obj);
+	    objlist_remove(&list_fini, elm->obj);
+	}
+    }
+    unload_objects(lockstate);
 }
 
 static Obj_Entry *
@@ -3100,7 +3143,7 @@ dlopen_object(const char *name, int fd, Obj_Entry *refobj, int lo_flags,
 	      (mode & RTLD_MODEMASK) == RTLD_NOW, &obj_rtld,
 	      (lo_flags & RTLD_LO_EARLY) ? SYMLOOK_EARLY : 0,
 	      lockstate) == -1) {
-		dlopen_cleanup(obj);
+		dlopen_cleanup(obj, lockstate);
 		obj = NULL;
 	    } else if (lo_flags & RTLD_LO_EARLY) {
 		/*
@@ -3159,7 +3202,7 @@ dlopen_object(const char *name, int fd, Obj_Entry *refobj, int lo_flags,
       (lo_flags & RTLD_LO_EARLY) ? SYMLOOK_EARLY : 0,
       lockstate) == -1) {
 	objlist_clear(&initlist);
-	dlopen_cleanup(obj);
+	dlopen_cleanup(obj, lockstate);
 	if (lockstate == &mlockstate)
 	    lock_release(rtld_bind_lock, lockstate);
 	return (NULL);
@@ -4010,6 +4053,9 @@ symlook_obj(SymLook *req, const Obj_Entry *obj)
     SymLook req1;
     int flags, res, mres;
 
+    if (obj->load_failed)
+	return (ESRCH);
+
     /*
      * If there is at least one valid hash at this point, we prefer to
      * use the faster GNU version if available.
@@ -4331,60 +4377,350 @@ trace_loaded_objects(Obj_Entry *obj)
 }
 
 /*
- * Unload a dlopened object and its dependencies from memory and from
- * our data structures.  It is assumed that the DAG rooted in the
- * object has already been unreferenced, and that the object has a
- * reference count of 0.
+ * Relocation dependencies affect lifetime, but must not change symbol lookup
+ * scope.  Use the existing lock restart so lazy binding can add an edge under
+ * the write lock; eager and startup relocation already have exclusive access.
+ * Edges to the main program are dropped: it is never unloaded, and most of
+ * them are undefined weak symbols resolved to sym_zero, so keeping them would
+ * only tie the whole startup graph into one cycle with the main object.
  */
 static void
-unload_object(Obj_Entry *root)
+add_relocdep(const Obj_Entry *refobj, const Obj_Entry *defobj,
+    RtldLockState *lockstate)
 {
     Obj_Entry *obj;
-    Obj_Entry **linkp;
 
-    assert(root->refcount == 0);
+    if (refobj == defobj || refobj->rtld || defobj->rtld ||
+      defobj == obj_main)
+	return;
+    obj = __DECONST(Obj_Entry *, refobj);
+    if (objlist_find(&obj->relocdeps, defobj) != NULL)
+	return;
+    lock_restart_for_upgrade(lockstate);
+    objlist_push_tail(&obj->relocdeps, __DECONST(Obj_Entry *, defobj));
+    graph_gen++;
+}
 
-    /*
-     * Pass over the DAG removing unreferenced objects from
-     * appropriate lists.
-     */
-    unlink_object(root);
+/*
+ * Mark every object that is reachable from an ordinary load reference,
+ * following declared dependencies and relocation edges.  Relocation edges do
+ * not increment refcounts, so an unreachable cycle is still collectable.
+ */
+static void
+mark_live_objects(void)
+{
+    Obj_Entry *obj, **stack;
+    Needed_Entry *needed;
+    Objlist_Entry *elm;
+    unsigned int sp;
 
-    /* Unmap all objects that are no longer referenced. */
-    linkp = &obj_list->next;
-    while ((obj = *linkp) != NULL) {
-	if (obj->refcount == 0) {
-	    LD_UTRACE(UTRACE_UNLOAD_OBJECT, obj, obj->mapbase, obj->mapsize, 0,
-		obj->path);
-	    dbg("unloading \"%s\"", obj->path);
-	    unload_filtees(root);
-	    munmap(obj->mapbase, obj->mapsize);
-	    linkmap_delete(obj);
-	    *linkp = obj->next;
-	    obj_count--;
-	    obj_free(obj);
-	} else
-	    linkp = &obj->next;
+    stack = alloca(obj_count * sizeof(*stack));
+    sp = 0;
+    for (obj = obj_list; obj != NULL; obj = obj->next) {
+	obj->live = obj->refcount != 0 || obj->fini_running;
+	if (obj->live)
+	    stack[sp++] = obj;
     }
-    obj_tail = linkp;
+    while (sp > 0) {
+	obj = stack[--sp];
+	for (needed = obj->needed; needed != NULL; needed = needed->next) {
+	    if (needed->obj != NULL && !needed->obj->live) {
+		needed->obj->live = true;
+		stack[sp++] = needed->obj;
+	    }
+	}
+	STAILQ_FOREACH(elm, &obj->relocdeps, link) {
+	    if (!elm->obj->live) {
+		elm->obj->live = true;
+		stack[sp++] = elm->obj;
+	    }
+	}
+    }
+}
+
+static bool
+fini_bit(const unsigned long *set, unsigned int i)
+{
+    return ((set[i / (8 * sizeof(*set))] >> (i % (8 * sizeof(*set)))) & 1UL)
+      != 0;
 }
 
 static void
-unlink_object(Obj_Entry *root)
+fini_bitset(unsigned long *set, unsigned int i)
 {
+    set[i / (8 * sizeof(*set))] |= 1UL << (i % (8 * sizeof(*set)));
+}
+
+static void
+fini_order_reset(void)
+{
+    /* The buffers are kept: a plugin loop rebuilds this state per dlclose. */
+    fini_order.list = NULL;
+    fini_order.n = 0;
+    fini_order.built = false;
+    fini_order.degraded = false;
+}
+
+/*
+ * Work out, for this pass, which candidates block which.  A candidate is an
+ * object on the finalization list that is dying (or every list entry when
+ * exiting); the walk itself covers every dying object, because an object
+ * without a finalizer is not on the list but still relays a dependency from
+ * one candidate to another.  The mark serial only increases, so a mark from an
+ * earlier build can never be mistaken for one of this build.
+ */
+static void
+fini_order_build(Objlist *list, bool exiting)
+{
+    Obj_Entry *obj, **stack;
     Objlist_Entry *elm;
+    Needed_Entry *needed;
+    const Objlist_Entry *dep;
+    unsigned long *row, *col, *nreach, *nrreach;
+    Obj_Entry **ncand;
+    unsigned int *nblocked;
+    unsigned int i, j, n, sp, serial, words;
 
-    if (root->refcount == 0) {
-	/* Remove the object from the RTLD_GLOBAL list. */
-	objlist_remove(&list_global, root);
+    fini_order_reset();
+    if (!exiting)
+	mark_live_objects();
+    for (obj = obj_list; obj != NULL; obj = obj->next) {
+	obj->fini_cand = false;
+	obj->fini_walk = exiting || !obj->live;
+    }
+    n = 0;
+    STAILQ_FOREACH(elm, list, link)
+	if (elm->obj->fini_walk)
+	    n++;
+    fini_order.list = list;
+    fini_order.n = n;
+    fini_order.graph_gen = graph_gen;
+    fini_order.ref_gen = ref_gen;
+    fini_order.exiting = exiting;
+    fini_order.built = true;
+    if (n == 0)
+	return;
+    words = (n + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long));
+    if (n > fini_order.cap) {
+	ncand = calloc(n, sizeof(*ncand));
+	nblocked = calloc(n, sizeof(*nblocked));
+	if (ncand == NULL || nblocked == NULL) {
+	    free(ncand);
+	    free(nblocked);
+	    goto degraded;
+	}
+	free(fini_order.cand);
+	free(fini_order.blocked);
+	fini_order.cand = ncand;
+	fini_order.blocked = nblocked;
+	fini_order.cap = n;
+    }
+    if (n * words > fini_order.bits_cap) {
+	nreach = calloc(n * words, sizeof(*nreach));
+	nrreach = calloc(n * words, sizeof(*nrreach));
+	if (nreach == NULL || nrreach == NULL) {
+	    free(nreach);
+	    free(nrreach);
+	    goto degraded;
+	}
+	free(fini_order.reach);
+	free(fini_order.rreach);
+	fini_order.reach = nreach;
+	fini_order.rreach = nrreach;
+	fini_order.bits_cap = n * words;
+    }
+    memset(fini_order.cand, 0, n * sizeof(*fini_order.cand));
+    memset(fini_order.blocked, 0, n * sizeof(*fini_order.blocked));
+    memset(fini_order.reach, 0, n * words * sizeof(*fini_order.reach));
+    memset(fini_order.rreach, 0, n * words * sizeof(*fini_order.rreach));
+    fini_order.words = words;
+    i = 0;
+    STAILQ_FOREACH(elm, list, link) {
+	if (!elm->obj->fini_walk)
+	    continue;
+	elm->obj->fini_index = i;
+	elm->obj->fini_cand = true;
+	fini_order.cand[i] = elm->obj;
+	i++;
+    }
 
-    	/* Remove the object from all objects' DAG lists. */
-	STAILQ_FOREACH(elm, &root->dagmembers, link) {
-	    objlist_remove(&elm->obj->dldags, root);
-	    if (elm->obj != root)
-		unlink_object(elm->obj);
+    stack = alloca(obj_count * sizeof(*stack));
+    for (i = 0; i < n; i++) {
+	row = fini_order.reach + i * words;
+	serial = ++mark_serial;
+	if (serial == 0) {
+	    /* The serial wrapped; never reuse an old mark. */
+	    for (obj = obj_list; obj != NULL; obj = obj->next)
+		obj->fini_mark = 0;
+	    serial = ++mark_serial;
+	}
+	fini_order.cand[i]->fini_mark = serial;
+	stack[0] = fini_order.cand[i];
+	sp = 1;
+	while (sp > 0) {
+	    obj = stack[--sp];
+	    if (obj->fini_cand)
+		fini_bitset(row, obj->fini_index);
+	    for (needed = obj->needed; needed != NULL;
+	      needed = needed->next) {
+		if (needed->obj != NULL && needed->obj->fini_walk &&
+		  needed->obj->fini_mark != serial) {
+		    needed->obj->fini_mark = serial;
+		    stack[sp++] = needed->obj;
+		}
+	    }
+	    STAILQ_FOREACH(dep, &obj->relocdeps, link) {
+		if (dep->obj->fini_walk &&
+		  dep->obj->fini_mark != serial) {
+		    dep->obj->fini_mark = serial;
+		    stack[sp++] = dep->obj;
+		}
+	    }
 	}
     }
+    for (i = 0; i < n; i++) {
+	row = fini_order.reach + i * words;
+	for (j = 0; j < n; j++)
+	    if (fini_bit(row, j))
+		fini_bitset(fini_order.rreach + j * words, i);
+    }
+    for (j = 0; j < n; j++) {
+	col = fini_order.rreach + j * words;
+	for (i = 0; i < n; i++) {
+	    if (i == j || !fini_bit(col, i))
+		continue;
+	    if (!fini_bit(fini_order.reach + j * words, i))
+		fini_order.blocked[j]++;
+	}
+    }
+    return;
+degraded:
+    /*
+     * Without memory for the relation, fall back to the legacy list order
+     * rather than failing: the collector must keep working under pressure.
+     */
+    fini_order.n = 0;
+    fini_order.degraded = true;
+}
+
+/*
+ * Pick the first candidate in list order that no other candidate has to be
+ * finalized before, and drop it from the candidate set.  With no dependency
+ * between candidates nothing blocks anything, so this returns the list head
+ * every time: exactly the legacy order.  Mutually dependent objects (a cycle)
+ * do not block each other, so the first of them in list order wins.
+ */
+static Objlist_Entry *
+next_fini(Objlist *list, bool exiting)
+{
+    Objlist_Entry *elm;
+    Obj_Entry *chosen;
+    unsigned long *row, *col;
+    unsigned int i, j, n, words;
+
+    if (!fini_order.built || fini_order.list != list ||
+      fini_order.exiting != exiting ||
+      fini_order.graph_gen != graph_gen || fini_order.ref_gen != ref_gen)
+	fini_order_build(list, exiting);
+    if (fini_order.degraded) {
+	STAILQ_FOREACH(elm, list, link)
+	    if (exiting || !elm->obj->live)
+		return elm;
+	return NULL;
+    }
+    n = fini_order.n;
+    words = fini_order.words;
+    chosen = NULL;
+    for (i = 0; i < n; i++) {
+	if (!fini_order.cand[i]->fini_cand)
+	    continue;
+	if (fini_order.blocked[i] == 0) {
+	    chosen = fini_order.cand[i];
+	    break;
+	}
+    }
+    if (chosen == NULL) {
+	/* Safety net: should be unreachable, cycles do not block. */
+	for (i = 0; i < n; i++)
+	    if (fini_order.cand[i]->fini_cand) {
+		chosen = fini_order.cand[i];
+		break;
+	    }
+    }
+    if (chosen == NULL)
+	return NULL;
+    i = chosen->fini_index;
+    row = fini_order.reach + i * words;
+    col = fini_order.rreach + i * words;
+    for (j = 0; j < n; j++)
+	if (fini_bit(row, j) && !fini_bit(col, j) &&
+	  fini_order.blocked[j] > 0)
+	    fini_order.blocked[j]--;
+    chosen->fini_cand = false;
+    STAILQ_FOREACH(elm, list, link)
+	if (elm->obj == chosen)
+	    return elm;
+    return NULL;
+}
+
+/*
+ * The bind write lock is held except while calling a finalizer.  A nested
+ * close only drops its ordinary references; this collector then recomputes
+ * reachability before calling another finalizer or unmapping any object.
+ * A NULL lockstate means the caller is single threaded before main (an early
+ * filtee load failed); no finalizer can be pending there, and calling one
+ * would pass the NULL state to lock_release().
+ */
+static void
+unload_objects(RtldLockState *lockstate)
+{
+    Obj_Entry *obj, **linkp;
+    Objlist_Entry *elm;
+
+    if (collecting)
+	return;
+    collecting = true;
+    for (;;) {
+	if (lockstate != NULL)
+	    objlist_call_fini(&list_fini, false, lockstate);
+	mark_live_objects();
+	for (obj = obj_list; obj != NULL; obj = obj->next)
+	    if (!obj->live && obj->filtees_loaded)
+		break;
+	if (obj == NULL)
+	    break;
+	/* This can drop the last ordinary references to the filtees. */
+	unload_filtees(obj);
+    }
+
+    GDB_STATE(RT_DELETE, NULL);
+    /* Unlink every dying root while all of the DAG entries still exist. */
+    for (obj = obj_list; obj != NULL; obj = obj->next) {
+	if (obj->live)
+	    continue;
+	objlist_remove(&list_global, obj);
+	STAILQ_FOREACH(elm, &obj->dagmembers, link)
+	    objlist_remove(&elm->obj->dldags, obj);
+    }
+    linkp = &obj_list->next;
+    while ((obj = *linkp) != NULL) {
+	if (obj->live) {
+	    linkp = &obj->next;
+	    continue;
+	}
+	LD_UTRACE(UTRACE_UNLOAD_OBJECT, obj, obj->mapbase, obj->mapsize, 0,
+	    obj->path);
+	dbg("unloading \"%s\"", obj->path);
+	munmap(obj->mapbase, obj->mapsize);
+	linkmap_delete(obj);
+	*linkp = obj->next;
+	obj_count--;
+	graph_gen++;
+	obj_free(obj);
+    }
+    obj_tail = linkp;
+    collecting = false;
+    GDB_STATE(RT_CONSISTENT, NULL);
 }
 
 static void
@@ -4393,6 +4729,7 @@ ref_dag(Obj_Entry *root)
     Objlist_Entry *elm;
 
     assert(root->dag_inited);
+    ref_gen++;
     STAILQ_FOREACH(elm, &root->dagmembers, link)
 	elm->obj->refcount++;
 }
@@ -4403,6 +4740,7 @@ unref_dag(Obj_Entry *root)
     Objlist_Entry *elm;
 
     assert(root->dag_inited);
+    ref_gen++;
     STAILQ_FOREACH(elm, &root->dagmembers, link)
 	elm->obj->refcount--;
 }

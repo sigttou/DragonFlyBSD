@@ -265,6 +265,14 @@ typedef struct Struct_Obj_Entry {
     dev_t dev;			/* Object's filesystem's device */
     ino_t ino;			/* Object's inode number */
     void *priv;			/* Platform-dependent */
+    Objlist relocdeps;		/* Relocation providers, not lookup scope (%) */
+    bool live;			/* Reachable during unload collection */
+    bool fini_running;		/* Finalizer currently runs without bind lock */
+    bool load_failed;		/* Do not reuse a partially relocated object */
+    unsigned int fini_index;	/* Candidate index, see fini_order_build() */
+    unsigned int fini_mark;	/* Increasing reachability mark */
+    bool fini_cand;		/* Is a candidate of the current pass */
+    bool fini_walk;		/* Takes part in the reachability walk */
 } Obj_Entry;
 
 #define RTLD_MAGIC	0xd550b87a
